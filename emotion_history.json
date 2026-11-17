@@ -1,0 +1,51 @@
+[
+    {
+        "time": "2026-11-17 22:19:58",
+        "emotion": "開心",
+        "text_type": "其他",
+        "text_length": 5,
+        "method": "Qwen + LoRA"
+    },
+    {
+        "time": "2026-11-17 22:20:37",
+        "emotion": "悲傷",
+        "text_type": "其他",
+        "text_length": 11,
+        "method": "Qwen + LoRA"
+    },
+    {
+        "time": "2026-11-17 22:20:47",
+        "emotion": "開心",
+        "text_type": "其他",
+        "text_length": 5,
+        "method": "Qwen + LoRA"
+    },
+    {
+        "time": "2026-11-17 22:25:13",
+        "emotion": "悲傷",
+        "text_type": "其他",
+        "text_length": 10,
+        "method": "Qwen + LoRA"
+    },
+    {
+        "time": "2026-11-17 22:26:33",
+        "emotion": "悲傷",
+        "text_type": "其他",
+        "text_length": 10,
+        "method": "Qwen + LoRA"
+    },
+    {
+        "time": "2026-11-17 22:33:44",
+        "emotion": "悲傷",
+        "text_type": "古文",
+        "text_length": 10,
+        "method": "Qwen + LoRA"
+    },
+    {
+        "time": "2026-11-17 22:49:06",
+        "emotion": "悲傷",
+        "text_type": "古文",
+        "text_length": 10,
+        "method": "Qwen + LoRA"
+    }
+]
