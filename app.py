@@ -7,9 +7,11 @@ import json
 import re
 import hmac
 import uuid
+import ast
 
 from datetime import datetime, date
 from supabase import create_client
+
 
 # =========================================================
 # 1. 系統設定
@@ -18,7 +20,7 @@ from supabase import create_client
 st.set_page_config(
     page_title="AI 情緒智慧分析系統",
     page_icon="💗",
-    layout="wide"
+    layout="wide",
 )
 
 EMOTIONS = [
@@ -65,6 +67,7 @@ EMOTION_INFO = {
     }
 }
 
+
 # =========================================================
 # 2. Session State
 # =========================================================
@@ -86,30 +89,56 @@ if "admin_authenticated" not in st.session_state:
 
 
 # =========================================================
-# 3. Supabase
+# 3. Secrets 設定
+# =========================================================
+
+def get_secret(name, default=""):
+    try:
+        value = st.secrets.get(name, default)
+
+        if value is None:
+            return default
+
+        return str(value).strip()
+
+    except Exception:
+        return default
+
+
+INFERENCE_API_URL = get_secret(
+    "INFERENCE_API_URL"
+).rstrip("/")
+
+INFERENCE_API_TOKEN = get_secret(
+    "INFERENCE_API_TOKEN"
+)
+
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")
+
+
+# =========================================================
+# 4. Supabase 資料庫
 # =========================================================
 
 @st.cache_resource(show_spinner=False)
 def get_supabase():
 
     try:
-        url = str(
-            st.secrets.get("SUPABASE_URL", "") or ""
-        ).strip()
-
-        key = str(
-            st.secrets.get("SUPABASE_KEY", "") or ""
-        ).strip()
-
-        if not url or not key:
+        if not SUPABASE_URL or not SUPABASE_KEY:
             return None
 
-        if not url.startswith(("https://", "http://")):
+        if not SUPABASE_URL.startswith("https://"):
             return None
 
-        return create_client(url, key)
+        return create_client(
+            SUPABASE_URL,
+            SUPABASE_KEY
+        )
 
-    except Exception:
+    except Exception as exc:
+        print("Supabase 連線錯誤：", exc)
         return None
 
 
@@ -147,7 +176,6 @@ def fetch_my_records():
         return []
 
     try:
-
         response = (
             client.table("emotion_records")
             .select("*")
@@ -197,89 +225,251 @@ def fetch_all_records():
 
 
 # =========================================================
-# 4. Mac Qwen + LoRA API
+# 5. Mac Qwen + LoRA API
 # =========================================================
 
-def generate_text(prompt, max_new_tokens=300):
+def generate_text(prompt, max_new_tokens=400):
 
-    api_url = str(
-        st.secrets.get("INFERENCE_API_URL", "") or ""
-    ).strip().rstrip("/")
-
-    api_token = str(
-        st.secrets.get("INFERENCE_API_TOKEN", "") or ""
-    ).strip()
-
-    if not api_url or not api_token:
+    if not INFERENCE_API_URL:
         raise RuntimeError(
-            "請設定 INFERENCE_API_URL 和 INFERENCE_API_TOKEN。"
+            "INFERENCE_API_URL 尚未設定。"
+        )
+
+    if not INFERENCE_API_TOKEN:
+        raise RuntimeError(
+            "INFERENCE_API_TOKEN 尚未設定。"
         )
 
     try:
 
         response = requests.post(
-            f"{api_url}/analyze",
+            f"{INFERENCE_API_URL}/analyze",
             json={
                 "prompt": prompt,
                 "max_new_tokens": max_new_tokens
             },
             headers={
-                "Authorization": f"Bearer {api_token}"
+                "Authorization": f"Bearer {INFERENCE_API_TOKEN}"
             },
             timeout=(15, 240)
         )
 
         response.raise_for_status()
 
-        result = response.json()
+        try:
+            result = response.json()
 
-        text = result.get("text")
+        except ValueError:
+            raise RuntimeError(
+                "API 沒有回傳有效 JSON。\n\n"
+                + response.text[:2000]
+            )
 
-        if not isinstance(text, str) or not text.strip():
-            raise RuntimeError("模型沒有產生有效內容。")
+        generated_text = None
 
-        return text.strip()
+        if isinstance(result, str):
+            generated_text = result
+
+        elif isinstance(result, dict):
+
+            possible_keys = [
+                "text",
+                "generated_text",
+                "response",
+                "output",
+                "answer",
+                "content"
+            ]
+
+            for key in possible_keys:
+
+                value = result.get(key)
+
+                if isinstance(value, str) and value.strip():
+                    generated_text = value
+                    break
+
+            if generated_text is None:
+
+                nested = result.get("result")
+
+                if isinstance(nested, dict):
+
+                    for key in possible_keys:
+
+                        value = nested.get(key)
+
+                        if isinstance(value, str) and value.strip():
+                            generated_text = value
+                            break
+
+                elif isinstance(nested, str) and nested.strip():
+                    generated_text = nested
+
+        elif isinstance(result, list) and result:
+
+            first = result[0]
+
+            if isinstance(first, dict):
+
+                generated_text = (
+                    first.get("generated_text")
+                    or first.get("text")
+                )
+
+        if not isinstance(generated_text, str):
+
+            raise RuntimeError(
+                "API 找不到模型輸出文字。\n\n"
+                "API 原始回覆：\n"
+                + repr(result)[:2500]
+            )
+
+        generated_text = generated_text.strip()
+
+        if not generated_text:
+            raise RuntimeError("Qwen 回傳空白內容。")
+
+        return generated_text
 
     except requests.exceptions.Timeout:
+
         raise RuntimeError(
-            "模型回應逾時，請確認 Mac 是否正在執行模型。"
+            "模型回應逾時，請確認 Mac 推論服務是否正常。"
         )
 
     except requests.exceptions.ConnectionError:
+
         raise RuntimeError(
             "無法連接 Mac 推論服務，請確認 API 和 Tunnel 是否啟動。"
         )
 
     except requests.exceptions.HTTPError as exc:
+
+        detail = ""
+
+        if exc.response is not None:
+            detail = exc.response.text[:2000]
+
         raise RuntimeError(
-            f"模型 API 發生錯誤：{exc}"
+            f"模型 API HTTP 錯誤：{exc}\n\n"
+            f"API 回應：\n{detail}"
         )
 
 
 # =========================================================
-# 5. JSON 解析
+# 6. JSON 解析與修復
 # =========================================================
 
 def extract_json(text):
 
-    try:
-        return json.loads(text)
+    if not isinstance(text, str) or not text.strip():
+        return None
 
-    except Exception:
+    cleaned = text.strip()
 
-        match = re.search(r"\{[\s\S]*\}", text)
+    cleaned = re.sub(
+        r"```(?:json)?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE
+    )
 
-        if match:
-            try:
-                return json.loads(match.group())
-            except Exception:
-                return None
+    cleaned = cleaned.replace("```", "").strip()
+
+    cleaned = (
+        cleaned
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+
+    def parse_candidate(candidate):
+
+        candidate = candidate.strip()
+
+        if not candidate:
+            return None
+
+        try:
+            result = json.loads(candidate)
+
+            if isinstance(result, dict):
+                return result
+
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        repaired = re.sub(
+            r",\s*([}\]])",
+            r"\1",
+            candidate
+        )
+
+        try:
+            result = json.loads(repaired)
+
+            if isinstance(result, dict):
+                return result
+
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        try:
+            result = ast.literal_eval(candidate)
+
+            if isinstance(result, dict):
+                return result
+
+        except (ValueError, SyntaxError, TypeError):
+            pass
+
+        return None
+
+    result = parse_candidate(cleaned)
+
+    if result is not None:
+        return result
+
+    decoder = json.JSONDecoder()
+
+    for start, char in enumerate(cleaned):
+
+        if char != "{":
+            continue
+
+        candidate = cleaned[start:]
+
+        try:
+            result, _ = decoder.raw_decode(candidate)
+
+            if isinstance(result, dict):
+                return result
+
+        except json.JSONDecodeError:
+            pass
+
+        repaired = re.sub(
+            r",\s*([}\]])",
+            r"\1",
+            candidate
+        )
+
+        try:
+            result, _ = decoder.raw_decode(repaired)
+
+            if isinstance(result, dict):
+                return result
+
+        except json.JSONDecodeError:
+            pass
 
     return None
 
 
 # =========================================================
-# 6. AI 情緒分析
+# 7. AI 情緒分析
 # =========================================================
 
 def analyze_emotion(user_text):
@@ -292,65 +482,155 @@ def analyze_emotion(user_text):
 
 不要只根據單一關鍵字分類。
 
-情緒只能選擇：
+情緒只能選擇以下六種：
 開心、悲傷、憤怒、恐懼、平靜、焦慮。
 
-請分析：
-1. 主要情緒
-2. 文字類型
-3. 情緒原因
-4. 情緒強度（1到5）
-5. 溫暖且具體的關懷建議
+請分析以下五個項目：
 
-只輸出 JSON，不要輸出其他文字。
+1. emotion：主要情緒
+2. text_type：文字類型
+3. reason：情緒原因分析
+4. intensity：情緒強度，必須是 1 到 5 的整數
+5. advice：溫暖且具體的關懷建議
 
-格式：
+嚴格遵守：
+- 只輸出 JSON。
+- 不要輸出 Markdown。
+- 不要輸出其他解釋。
+- 欄位名稱使用雙引號。
+- 五個欄位都不可缺少。
+- emotion 必須是指定的六種情緒之一。
+- intensity 必須是 1 到 5 的整數。
+- 請使用繁體中文。
+
+輸出格式：
 
 {{
-    "emotion": "六種情緒其中之一",
-    "text_type": "文字類型",
+    "emotion": "開心",
+    "text_type": "日常生活",
     "reason": "情緒原因分析",
     "intensity": 3,
-    "advice": "關懷建議"
+    "advice": "溫暖且具體的建議"
 }}
 
 使用者文字：
+
 {user_text}
+
+請直接輸出 JSON：
 """
 
     response = generate_text(
         prompt,
-        max_new_tokens=300
+        max_new_tokens=400
     )
 
     data = extract_json(response)
 
+    # 第一次失敗時，讓原模型重新整理格式
     if not isinstance(data, dict):
-        raise ValueError("AI JSON 格式錯誤。")
 
-    emotion = data.get("emotion")
+        repair_prompt = f"""
+請將以下模型回答整理成合法 JSON。
+
+只能輸出以下五個欄位：
+emotion、text_type、reason、intensity、advice。
+
+emotion 只能是：
+開心、悲傷、憤怒、恐懼、平靜、焦慮。
+
+intensity 必須是 1 到 5 的整數。
+
+不要增加其他欄位，不要輸出解釋。
+
+原始回答：
+{response}
+
+請輸出 JSON：
+"""
+
+        repair_response = generate_text(
+            repair_prompt,
+            max_new_tokens=300
+        )
+
+        data = extract_json(repair_response)
+
+        if not isinstance(data, dict):
+
+            raise ValueError(
+                "AI JSON 格式錯誤，無法解析模型回覆。\n\n"
+                "第一次原始回覆：\n"
+                + repr(response)[:1800]
+                + "\n\n第二次修復回覆：\n"
+                + repr(repair_response)[:1200]
+            )
+
+    # 情緒分類
+    emotion = str(
+        data.get("emotion", "")
+    ).strip()
+
+    emotion = re.sub(
+        r"^(主要情緒|情緒分類|情緒)\s*[:：]\s*",
+        "",
+        emotion
+    ).strip()
 
     if emotion not in EMOTIONS:
-        raise ValueError(f"情緒分類錯誤：{emotion}")
 
+        raise ValueError(
+            f"情緒分類錯誤：{emotion}\n\n"
+            "模型原始回覆：\n"
+            + repr(response)[:1500]
+        )
+
+    # 情緒強度
     try:
-        intensity = int(data.get("intensity", 3))
-    except (ValueError, TypeError):
+
+        raw_intensity = data.get("intensity", 3)
+
+        if isinstance(raw_intensity, str):
+
+            match = re.search(
+                r"[1-5]",
+                raw_intensity
+            )
+
+            intensity = int(match.group()) if match else 3
+
+        else:
+            intensity = int(float(raw_intensity))
+
+    except (ValueError, TypeError, OverflowError):
         intensity = 3
+
+    intensity = max(1, min(5, intensity))
+
+    text_type = str(
+        data.get("text_type") or "日常對話"
+    ).strip()
+
+    reason = str(
+        data.get("reason") or "AI 正在理解你的文字內容。"
+    ).strip()
+
+    advice = str(
+        data.get("advice")
+        or EMOTION_INFO[emotion]["advice"]
+    ).strip()
 
     return {
         "emotion": emotion,
-        "text_type": str(data.get("text_type", "日常對話")),
-        "reason": str(data.get("reason", "AI 正在理解你的文字內容。")),
-        "intensity": max(1, min(5, intensity)),
-        "advice": str(
-            data.get("advice") or EMOTION_INFO[emotion]["advice"]
-        )
+        "text_type": text_type,
+        "reason": reason,
+        "intensity": intensity,
+        "advice": advice
     }
 
 
 # =========================================================
-# 7. Q版動態角色
+# 8. Q 版動態角色
 # =========================================================
 
 def avatar_svg(emotion):
@@ -367,7 +647,6 @@ def avatar_svg(emotion):
     <head>
     <meta charset="UTF-8">
     <style>
-
     body {{
         margin: 0;
         padding: 10px;
@@ -424,12 +703,10 @@ def avatar_svg(emotion):
         0%,100% {{transform:rotate(0)}}
         50% {{transform:rotate(5deg)}}
     }}
-
     </style>
     </head>
 
     <body>
-
     <div class="avatar-container">
         <div class="avatar">{emoji}</div>
     </div>
@@ -437,7 +714,6 @@ def avatar_svg(emotion):
     <h3 style="text-align:center;color:{color}">
         {emotion}
     </h3>
-
     </body>
     </html>
     """
@@ -466,7 +742,7 @@ def show_avatar(emotion):
 
 
 # =========================================================
-# 8. 側邊欄
+# 9. 側邊欄
 # =========================================================
 
 with st.sidebar:
@@ -474,9 +750,31 @@ with st.sidebar:
     st.header("⚙️ 系統設定")
 
     st.markdown("### 🤖 AI 模型")
+
     st.write("Qwen2.5-0.5B-Instruct")
     st.write("原本 LoRA 情緒辨識模型")
     st.write("Mac 本機推論 API")
+
+    st.divider()
+
+    st.markdown("### 🔌 服務連線狀態")
+
+    st.write(
+        "模型 API：",
+        "✅ 已設定" if INFERENCE_API_URL else "❌ 未設定"
+    )
+
+    st.write(
+        "API Token：",
+        "✅ 已設定" if INFERENCE_API_TOKEN else "❌ 未設定"
+    )
+
+    st.write(
+        "Supabase：",
+        "✅ 已設定"
+        if SUPABASE_URL and SUPABASE_KEY
+        else "❌ 未設定"
+    )
 
     st.divider()
 
@@ -495,7 +793,10 @@ with st.sidebar:
             )
 
             if uploaded:
-                st.session_state.custom_avatars[emotion] = uploaded.getvalue()
+
+                st.session_state.custom_avatars[emotion] = (
+                    uploaded.getvalue()
+                )
 
             if emotion in st.session_state.custom_avatars:
 
@@ -504,7 +805,10 @@ with st.sidebar:
                     width=120
                 )
 
-                if st.button("恢復預設角色", key=f"reset_{emotion}"):
+                if st.button(
+                    "恢復預設角色",
+                    key=f"reset_{emotion}"
+                ):
 
                     del st.session_state.custom_avatars[emotion]
                     st.rerun()
@@ -513,9 +817,14 @@ with st.sidebar:
 
     st.markdown("### 📊 本次連線紀錄")
 
-    st.write(f"目前分析：{len(st.session_state.history)} 筆")
+    st.write(
+        f"目前分析：{len(st.session_state.history)} 筆"
+    )
 
-    if st.button("清除本次畫面紀錄", use_container_width=True):
+    if st.button(
+        "清除本次畫面紀錄",
+        use_container_width=True
+    ):
 
         st.session_state.history = []
         st.session_state.analysis_result = None
@@ -523,19 +832,19 @@ with st.sidebar:
 
 
 # =========================================================
-# 9. 主頁面
+# 10. 主頁面
 # =========================================================
 
 st.title("💗 AI 情緒智慧分析系統")
 
 st.markdown(
-    "透過 Qwen2.5-0.5B 與原本 LoRA，理解文字中的情緒，"
-    "並提供情緒原因分析與主動關懷。"
+    "透過 Qwen2.5-0.5B 與原本 LoRA，"
+    "理解文字中的情緒，並提供情緒原因分析與主動關懷。"
 )
 
 st.info(
     "隱私告知：為提供情緒紀錄與管理功能，"
-    "您送出的文字及分析結果會儲存在資料庫，"
+    "您送出的文字及分析結果會儲存在資料庫。"
     "系統管理者可查看這些紀錄。"
     "請勿輸入密碼、身分證字號或其他不必要的敏感個資。"
 )
@@ -549,7 +858,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 
 # =========================================================
-# 10. 情緒主動分析
+# 11. 情緒主動分析
 # =========================================================
 
 with tab1:
@@ -576,15 +885,20 @@ with tab1:
     if analyze_button:
 
         if not user_text.strip():
+
             st.warning("請先輸入文字。")
 
         else:
 
             try:
 
-                with st.spinner("AI 正在理解你的文字與情緒..."):
+                with st.spinner(
+                    "AI 正在理解你的文字與情緒..."
+                ):
 
-                    result = analyze_emotion(user_text.strip())
+                    result = analyze_emotion(
+                        user_text.strip()
+                    )
 
                     result["input_text"] = user_text.strip()
 
@@ -595,17 +909,31 @@ with tab1:
                     )
 
                     st.session_state.analysis_result = result
+
                     st.session_state.history.append(result)
 
                     saved, message = save_record(result)
 
                     if saved:
+
                         st.success("分析完成，紀錄已儲存。")
+
                     else:
-                        st.warning(f"資料庫儲存失敗：{message}")
+
+                        st.warning(
+                            f"分析完成，但資料庫儲存失敗：{message}"
+                        )
 
             except Exception as exc:
+
                 st.error(f"AI 分析失敗：{exc}")
+
+                with st.expander(
+                    "查看完整除錯資訊",
+                    expanded=True
+                ):
+
+                    st.code(str(exc), language="text")
 
     if st.session_state.analysis_result:
 
@@ -639,8 +967,8 @@ with tab1:
             st.write(result["reason"])
 
         st.divider()
-
         st.subheader("💌 AI 主動關懷")
+
         st.info(result["advice"])
 
         st.caption(
@@ -652,7 +980,7 @@ with tab1:
 
 
 # =========================================================
-# 11. 個人情緒趨勢
+# 12. 個人情緒趨勢
 # =========================================================
 
 with tab2:
@@ -664,6 +992,7 @@ with tab2:
     if db_rows:
 
         df = pd.DataFrame(db_rows)
+
         df["time"] = pd.to_datetime(
             df["created_at"],
             errors="coerce"
@@ -671,7 +1000,9 @@ with tab2:
 
     elif st.session_state.history:
 
-        df = pd.DataFrame(st.session_state.history)
+        df = pd.DataFrame(
+            st.session_state.history
+        )
 
         df["time"] = pd.to_datetime(
             df["time"],
@@ -679,6 +1010,7 @@ with tab2:
         )
 
     else:
+
         df = pd.DataFrame()
 
     if df.empty:
@@ -687,9 +1019,20 @@ with tab2:
 
     else:
 
-        display_df = df[
-            ["time", "input_text", "emotion", "text_type", "intensity"]
-        ].copy()
+        required_columns = [
+            "time",
+            "input_text",
+            "emotion",
+            "text_type",
+            "intensity"
+        ]
+
+        for column in required_columns:
+
+            if column not in df.columns:
+                df[column] = None
+
+        display_df = df[required_columns].copy()
 
         display_df.columns = [
             "分析時間",
@@ -706,21 +1049,32 @@ with tab2:
         )
 
         st.divider()
-
         st.markdown("### 📈 情緒分布")
 
-        st.bar_chart(
+        emotion_counts = (
             df["emotion"]
             .value_counts()
             .reindex(EMOTIONS, fill_value=0)
         )
 
-        st.divider()
+        st.bar_chart(emotion_counts)
 
+        st.divider()
         st.markdown("### 📉 情緒強度變化")
 
         chart_df = (
-            df.dropna(subset=["time"])[["time", "intensity"]]
+            df.dropna(subset=["time"])
+            [["time", "intensity"]]
+            .copy()
+        )
+
+        chart_df["intensity"] = pd.to_numeric(
+            chart_df["intensity"],
+            errors="coerce"
+        )
+
+        chart_df = (
+            chart_df.dropna()
             .set_index("time")
             .sort_index()
         )
@@ -741,7 +1095,7 @@ with tab2:
 
 
 # =========================================================
-# 12. 系統介紹
+# 13. 系統介紹
 # =========================================================
 
 with tab3:
@@ -793,18 +1147,14 @@ with tab3:
 
 
 # =========================================================
-# 13. 管理者後台
+# 14. 管理者後台
 # =========================================================
 
 with tab4:
 
     st.subheader("🔐 管理者登入")
 
-    admin_password = st.secrets.get(
-        "ADMIN_PASSWORD", ""
-    )
-
-    if not admin_password:
+    if not ADMIN_PASSWORD:
 
         st.error("尚未設定 ADMIN_PASSWORD。")
 
@@ -826,13 +1176,14 @@ with tab4:
 
             if hmac.compare_digest(
                 entered_password,
-                str(admin_password)
+                ADMIN_PASSWORD
             ):
 
                 st.session_state.admin_authenticated = True
                 st.rerun()
 
             else:
+
                 st.error("密碼錯誤。")
 
     else:
@@ -887,22 +1238,20 @@ with tab4:
 
                     date_range = st.date_input(
                         "依日期篩選",
-                        value=(
-                            today.replace(day=1),
-                            today
-                        )
+                        value=(today.replace(day=1), today)
                     )
 
                 filtered = admin_df[
                     admin_df["emotion"].isin(selected_emotions)
-                ]
+                ].copy()
 
                 if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
 
                     start_date, end_date = date_range
 
                     filtered = filtered[
-                        (filtered["created_at"].dt.date >= start_date) &
+                        (filtered["created_at"].dt.date >= start_date)
+                        &
                         (filtered["created_at"].dt.date <= end_date)
                     ]
 
@@ -912,7 +1261,9 @@ with tab4:
                         filtered["created_at"].dt.date == date_range
                     ]
 
-                st.write(f"符合條件：{len(filtered):,} 筆")
+                st.write(
+                    f"符合條件：{len(filtered):,} 筆"
+                )
 
                 cols = [
                     "created_at",
@@ -924,6 +1275,11 @@ with tab4:
                     "intensity",
                     "advice"
                 ]
+
+                for column in cols:
+
+                    if column not in filtered.columns:
+                        filtered[column] = None
 
                 view_df = filtered[cols].copy()
 
@@ -956,18 +1312,24 @@ with tab4:
                 )
 
         except Exception as exc:
-            st.error(f"管理者資料讀取失敗：{exc}")
+
+            st.error(
+                f"管理者資料讀取失敗：{exc}"
+            )
 
 
 # =========================================================
-# 14. 頁尾
+# 15. 頁尾
 # =========================================================
 
 st.divider()
 
 st.markdown(
-    "<div style='text-align:center;color:gray;'>"
-    "AI 情緒智慧分析系統 | Qwen2.5 + LoRA Mac 本機推論"
-    "</div>",
+    """
+    <div style='text-align:center;color:gray;'>
+        AI 情緒智慧分析系統 |
+        Qwen2.5 + LoRA Mac 本機推論
+    </div>
+    """,
     unsafe_allow_html=True
 )
